@@ -1,615 +1,738 @@
 require('dotenv').config();
-const fs = require('node:fs/promises');
-const path = require('node:path');
+
+const { spawn } = require('node:child_process');
+const prism = require('prism-media');
+const WebSocket = require('ws');
+const ffmpegPath = require('ffmpeg-static');
+
 const {
   Client,
   GatewayIntentBits,
   PermissionFlagsBits,
 } = require('discord.js');
 
-const token = process.env.DISCORD_TOKEN;
-const prefix = process.env.PREFIX || '!';
-const protectedUsername = 'michael_2024_pro';
+const {
+  joinVoiceChannel,
+  entersState,
+  VoiceConnectionStatus,
+  getVoiceConnection,
+  createAudioPlayer,
+  createAudioResource,
+  NoSubscriberBehavior,
+  StreamType,
+  EndBehaviorType,
+  AudioPlayerStatus,
+} = require('@discordjs/voice');
 
-const nodAudioFiles = [
-  process.env.NOD_AUDIO_FILE_1 || path.join(__dirname, 'Nod1.ogg'),
-  process.env.NOD_AUDIO_FILE_2 || path.join(__dirname, 'Nod2.ogg'),
-  process.env.NOD_AUDIO_FILE_3 || path.join(__dirname, 'Nod3.ogg'),
-];
+const DISCORD_TOKEN = String(process.env.DISCORD_TOKEN || '').trim();
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 
-const parsedNodDuration = Number.parseFloat(
-  process.env.NOD_AUDIO_DURATION_SECONDS || '2.4',
-);
+const INPUT_COOLDOWN_MS = 1500;
+const MIN_INPUT_BYTES = 24000;
+const SILENCE_DURATION_MS = 700;
 
-const nodAudioDurationSeconds =
-  Number.isFinite(parsedNodDuration) && parsedNodDuration > 0
-    ? parsedNodDuration
-    : 2.4;
+const HEBREW_ONLY_INSTRUCTIONS = [
+  'You are a Discord voice bot.',
+  'The conversation language is Hebrew only.',
+  'Always speak and reply only in Hebrew.',
+  'Never speak Arabic.',
+  'Never switch to Arabic, English, or any other language, even if the audio is noisy, unclear, or mixed.',
+  'If the user speaks in another language, still answer only in Hebrew.',
+  'If the audio is unclear, ask the user to repeat, but do it in Hebrew.',
+  'Keep replies short, clear, warm, and conversational.',
+].join(' ');
 
-const WHAT_ARE_WE_COMMAND = 'מה אנחנו';
-const WHAT_ARE_WE_REPLIES = [
-  'חברים טובים כמו אחים',
-  'אחים ביולוגים לנצח',
-  'בני זוג מאמי',
-  'מה אנחנו?',
-];
-
-const PROTECTED_REPLY_MESSAGE =
-  'מי אתה חושב שאתה לעזאזל ? 😡 אל תתייג אותו';
-
-if (!token) {
+if (!DISCORD_TOKEN) {
   console.error('Missing DISCORD_TOKEN in .env');
   process.exit(1);
 }
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
-
-function normalizeName(value) {
-  return String(value || '').trim().toLowerCase();
+if (!OPENAI_API_KEY) {
+  console.error('Missing OPENAI_API_KEY in .env');
+  process.exit(1);
 }
 
-function isProtectedUser(user) {
-  if (!user) return false;
-
-  const username = normalizeName(user.username);
-  const globalName = normalizeName(user.globalName);
-
-  return (
-    username === normalizeName(protectedUsername) ||
-    globalName === normalizeName(protectedUsername)
-  );
+if (!ffmpegPath) {
+  console.error('ffmpeg-static was not found.');
+  process.exit(1);
 }
 
-function hasUserManageMessagesPermission(message) {
-  return message.member?.permissions?.has(PermissionFlagsBits.ManageMessages);
+const guildSessions = new Map();
+
+function parseAllowedUserIds() {
+  const multiIds = String(process.env.ALLOWED_USER_IDS || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  const singleId = String(process.env.ALLOWED_USER_ID || '').trim();
+
+  const allIds = [...multiIds];
+
+  if (singleId) {
+    allIds.push(singleId);
+  }
+
+  return new Set(allIds);
 }
 
-function hasBotManageMessagesPermission(message) {
-  return message.channel
-    .permissionsFor(message.guild.members.me)
-    ?.has(PermissionFlagsBits.ManageMessages);
+const allowedUserIds = parseAllowedUserIds();
+
+function isAllowedUser(userId) {
+  if (allowedUserIds.size === 0) {
+    return true;
+  }
+
+  return allowedUserIds.has(userId);
 }
 
-function hasUserModerateMembersPermission(message) {
-  return message.member?.permissions?.has(PermissionFlagsBits.ModerateMembers);
+function stopCurrentOutput(session) {
+  if (!session.currentOutput) return;
+
+  try {
+    session.player.stop(true);
+  } catch {}
+
+  try {
+    session.currentOutput.encoder.stdin.destroy();
+  } catch {}
+
+  try {
+    session.currentOutput.encoder.kill('SIGKILL');
+  } catch {}
+
+  session.currentOutput = null;
+  session.lastOutputAt = Date.now();
 }
 
-function hasBotModerateMembersPermission(message) {
-  return message.guild.members.me?.permissions?.has(PermissionFlagsBits.ModerateMembers);
+function finishAssistantAudio(session, responseId) {
+  if (!session.currentOutput) return;
+  if (responseId && session.currentOutput.responseId !== responseId) return;
+  if (session.currentOutput.closing) return;
+
+  session.currentOutput.closing = true;
+  session.lastOutputAt = Date.now();
+
+  try {
+    session.currentOutput.encoder.stdin.end();
+  } catch {}
 }
 
-function hasBotSendMessagesPermission(message) {
-  return message.channel
-    .permissionsFor(message.guild.members.me)
-    ?.has(PermissionFlagsBits.SendMessages);
+function createAssistantOutput(session, responseId) {
+  stopCurrentOutput(session);
+
+  const encoder = spawn(ffmpegPath, [
+    '-loglevel',
+    'error',
+    '-f',
+    's16le',
+    '-ar',
+    '24000',
+    '-ac',
+    '1',
+    '-i',
+    'pipe:0',
+    '-c:a',
+    'libopus',
+    '-b:a',
+    '64k',
+    '-application',
+    'audio',
+    '-frame_duration',
+    '20',
+    '-f',
+    'ogg',
+    'pipe:1',
+  ]);
+
+  encoder.on('error', (error) => {
+    console.error('Assistant output encoder error:', error);
+  });
+
+  encoder.stderr.on('data', (data) => {
+    const text = data.toString().trim();
+    if (text) {
+      console.error('Assistant output ffmpeg stderr:', text);
+    }
+  });
+
+  encoder.stdin.on('error', () => {});
+  encoder.stdout.on('error', () => {});
+
+  encoder.on('close', () => {
+    if (
+      session.currentOutput &&
+      session.currentOutput.responseId === responseId
+    ) {
+      session.currentOutput = null;
+    }
+  });
+
+  const resource = createAudioResource(encoder.stdout, {
+    inputType: StreamType.OggOpus,
+  });
+
+  session.player.play(resource);
+
+  session.currentOutput = {
+    responseId,
+    encoder,
+    closing: false,
+  };
 }
 
-function hasBotAttachFilesPermission(message) {
-  return message.channel
-    .permissionsFor(message.guild.members.me)
-    ?.has(PermissionFlagsBits.AttachFiles);
+function appendAssistantAudioDelta(session, responseId, deltaBase64) {
+  if (!deltaBase64) return;
+
+  if (
+    !session.currentOutput ||
+    session.currentOutput.responseId !== responseId
+  ) {
+    createAssistantOutput(session, responseId);
+  }
+
+  try {
+    const audioBuffer = Buffer.from(deltaBase64, 'base64');
+    session.currentOutput.encoder.stdin.write(audioBuffer);
+  } catch (error) {
+    console.error('Failed to append assistant audio delta:', error);
+  }
 }
 
-function getRecentDeletableMessages(messages) {
-  const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
-  const now = Date.now();
+function handleRealtimeEvent(session, event) {
+  switch (event.type) {
+    case 'session.created':
+      console.log(`Realtime session created for guild ${session.guildId}`);
+      break;
 
-  return messages.filter((msg) => {
-    const isRecentEnough = now - msg.createdTimestamp < fourteenDaysMs;
-    return !msg.pinned && isRecentEnough;
+    case 'session.updated':
+      console.log(`Realtime session updated for guild ${session.guildId}`);
+      break;
+
+    case 'input_audio_buffer.speech_started':
+      console.log(`OpenAI detected speech start in guild ${session.guildId}`);
+      stopCurrentOutput(session);
+      break;
+
+    case 'input_audio_buffer.speech_stopped':
+      console.log(`OpenAI detected speech stop in guild ${session.guildId}`);
+      break;
+
+    case 'input_audio_buffer.committed':
+      console.log(`Audio committed in guild ${session.guildId}`);
+      break;
+
+    case 'conversation.item.input_audio_transcription.completed':
+      if (event.transcript) {
+        console.log(`User transcript [${session.guildId}]: ${event.transcript}`);
+      }
+      break;
+
+    case 'response.created':
+      console.log(`Response created in guild ${session.guildId}`);
+      break;
+
+    case 'response.output_audio.delta':
+      appendAssistantAudioDelta(session, event.response_id, event.delta);
+      break;
+
+    case 'response.output_audio.done':
+      finishAssistantAudio(session, event.response_id);
+      break;
+
+    case 'response.done':
+      finishAssistantAudio(session, event.response?.id || null);
+      break;
+
+    case 'error':
+      console.error('OpenAI Realtime error event:', event);
+      break;
+
+    default:
+      break;
+  }
+}
+
+function createRealtimeSocket(session) {
+  return new Promise((resolve, reject) => {
+    let opened = false;
+
+    const ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-realtime', {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+    });
+
+    const timeout = setTimeout(() => {
+      try {
+        ws.close();
+      } catch {}
+      reject(new Error('Timed out while connecting to OpenAI Realtime.'));
+    }, 15000);
+
+    session.ws = ws;
+
+    ws.once('open', () => {
+      opened = true;
+      clearTimeout(timeout);
+      session.wsReady = true;
+
+      ws.send(
+        JSON.stringify({
+          type: 'session.update',
+          session: {
+            type: 'realtime',
+            model: 'gpt-realtime',
+            instructions: HEBREW_ONLY_INSTRUCTIONS,
+            max_response_output_tokens: 120,
+            audio: {
+              input: {
+                format: {
+                  type: 'audio/pcm',
+                  rate: 24000,
+                },
+                noise_reduction: {
+                  type: 'near_field',
+                },
+                transcription: {
+                  model: 'gpt-4o-mini-transcribe',
+                  language: 'he',
+                  prompt:
+                    'The speaker is speaking Hebrew. Expect Hebrew words, Hebrew names, and short Hebrew phrases.',
+                },
+                turn_detection: null,
+              },
+              output: {
+                format: {
+                  type: 'audio/pcm',
+                  rate: 24000,
+                },
+                voice: 'marin',
+                speed: 0.96,
+              },
+            },
+            output_modalities: ['audio'],
+          },
+        }),
+      );
+
+      console.log(`OpenAI Realtime connected for guild ${session.guildId}`);
+      resolve();
+    });
+
+    ws.on('message', (message) => {
+      try {
+        const event = JSON.parse(message.toString());
+        handleRealtimeEvent(session, event);
+      } catch (error) {
+        console.error('Failed to parse OpenAI event:', error);
+      }
+    });
+
+    ws.once('error', (error) => {
+      clearTimeout(timeout);
+
+      if (!opened) {
+        reject(error);
+        return;
+      }
+
+      console.error('OpenAI WebSocket error:', error);
+    });
+
+    ws.on('close', (code, reasonBuffer) => {
+      session.wsReady = false;
+
+      const reason =
+        reasonBuffer && reasonBuffer.length > 0
+          ? reasonBuffer.toString()
+          : 'No reason';
+
+      console.log(`OpenAI Realtime closed for guild ${session.guildId}: ${code} ${reason}`);
+    });
   });
 }
 
-function parseDuration(input) {
-  if (!input) return null;
+function sendPcmChunkToRealtime(session, chunk) {
+  if (!session.ws || session.ws.readyState !== WebSocket.OPEN) return;
+  if (!chunk || chunk.length === 0) return;
 
-  const match = input.trim().toLowerCase().match(/^(\d+)(s|m|h|d)$/);
-  if (!match) return null;
+  session.inputBytes += chunk.length;
 
-  const value = Number.parseInt(match[1], 10);
-  const unit = match[2];
-
-  if (!Number.isInteger(value) || value <= 0) return null;
-
-  const unitMap = {
-    s: 1000,
-    m: 60 * 1000,
-    h: 60 * 60 * 1000,
-    d: 24 * 60 * 60 * 1000,
-  };
-
-  return value * unitMap[unit];
-}
-
-function buildWaveform(length = 64) {
-  const bytes = new Uint8Array(length);
-
-  for (let i = 0; i < length; i += 1) {
-    const x = i / Math.max(length - 1, 1);
-    const value =
-      20 +
-      Math.round(
-        180 *
-          Math.abs(Math.sin(x * Math.PI * 2.7)) *
-          (0.35 + 0.65 * Math.sin(x * Math.PI)),
-      );
-
-    bytes[i] = Math.max(0, Math.min(255, value));
-  }
-
-  return Buffer.from(bytes).toString('base64');
-}
-
-function getAudioContentType(filePath) {
-  const extension = path.extname(filePath).toLowerCase();
-
-  const contentTypeMap = {
-    '.ogg': 'audio/ogg',
-    '.opus': 'audio/ogg',
-    '.mp3': 'audio/mpeg',
-    '.wav': 'audio/wav',
-    '.m4a': 'audio/mp4',
-    '.aac': 'audio/aac',
-    '.flac': 'audio/flac',
-  };
-
-  return contentTypeMap[extension] || null;
-}
-
-function getRandomNodAudioFile() {
-  return nodAudioFiles[Math.floor(Math.random() * nodAudioFiles.length)];
-}
-
-async function sendDiscordVoiceMessage(channel, filePath, durationSecs) {
-  const audioBuffer = await fs.readFile(filePath);
-  const fileName = path.basename(filePath);
-  const contentType = getAudioContentType(filePath);
-
-  if (!contentType) {
-    throw new Error(
-      'Unsupported audio format. Use .ogg, .opus, .mp3, .wav, .m4a, .aac, or .flac.',
-    );
-  }
-
-  const waveform = buildWaveform();
-  const form = new FormData();
-
-  form.append(
-    'files[0]',
-    new Blob([audioBuffer], { type: contentType }),
-    fileName,
-  );
-
-  form.append(
-    'payload_json',
+  session.ws.send(
     JSON.stringify({
-      flags: 1 << 13,
-      attachments: [
-        {
-          id: '0',
-          filename: fileName,
-          duration_secs: durationSecs,
-          waveform,
-        },
-      ],
+      type: 'input_audio_buffer.append',
+      audio: chunk.toString('base64'),
+    }),
+  );
+}
+
+function commitUserAudio(session, userId) {
+  if (!session.ws || session.ws.readyState !== WebSocket.OPEN) return;
+  if (!session.inputBytes || session.inputBytes <= 0) return;
+
+  if (session.inputBytes < MIN_INPUT_BYTES) {
+    console.log(`Ignoring short audio chunk (${session.inputBytes} bytes) from ${userId}`);
+    session.inputBytes = 0;
+    return;
+  }
+
+  console.log(`Committing ${session.inputBytes} bytes of audio for ${userId}`);
+
+  session.ws.send(
+    JSON.stringify({
+      type: 'input_audio_buffer.commit',
     }),
   );
 
-  const response = await fetch(
-    `https://discord.com/api/v10/channels/${channel.id}/messages`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bot ${token}`,
+  session.ws.send(
+    JSON.stringify({
+      type: 'response.create',
+      response: {
+        output_modalities: ['audio'],
+        instructions:
+          'Reply only in Hebrew. Never speak Arabic. If the audio is unclear, ask the user to repeat in Hebrew.',
       },
-      body: form,
-    },
+    }),
   );
 
-  const responseData = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    const details =
-      responseData && typeof responseData === 'object'
-        ? JSON.stringify(responseData)
-        : 'Unknown Discord API error';
-
-    throw new Error(`Discord API request failed (${response.status}): ${details}`);
-  }
-
-  return responseData;
+  session.inputBytes = 0;
 }
 
-async function sendTemporaryMessage(channel, content, delayMs = 4000) {
-  const sentMessage = await channel.send(content);
+function cleanupInputTracker(session, userId) {
+  const tracker = session.inputTrackers.get(userId);
+  if (!tracker) return;
 
-  setTimeout(() => {
-    sentMessage.delete().catch(() => {});
-  }, delayMs);
-}
-
-async function handleClearCommand(message, amount) {
-  const fetchLimit = Math.min(amount + 1, 100);
-  const fetchedMessages = await message.channel.messages.fetch({ limit: fetchLimit });
-  const deletableMessages = getRecentDeletableMessages(fetchedMessages);
-
-  await message.channel.bulkDelete(deletableMessages, true);
-
-  const deletedUserMessages = Math.max(
-    0,
-    Math.min(amount, deletableMessages.filter((msg) => msg.id !== message.id).size),
-  );
-
-  await sendTemporaryMessage(
-    message.channel,
-    `Deleted ${deletedUserMessages} message(s).`,
-  );
-}
-
-async function handleClearAllCommand(message) {
-  let deletedTotal = 0;
-
-  while (true) {
-    const fetchedMessages = await message.channel.messages.fetch({ limit: 100 });
-    const deletableMessages = getRecentDeletableMessages(fetchedMessages);
-
-    if (deletableMessages.size === 0) {
-      break;
-    }
-
-    await message.channel.bulkDelete(deletableMessages, true);
-    deletedTotal += deletableMessages.size;
-
-    if (deletableMessages.size < 100) {
-      break;
-    }
-  }
-
-  await sendTemporaryMessage(
-    message.channel,
-    `Clear all completed. Deleted ${deletedTotal} recent message(s).`,
-  );
-}
-
-async function isReplyToProtectedUser(message) {
-  if (!message.reference?.messageId) return false;
+  tracker.closed = true;
 
   try {
-    const repliedMessage = await message.fetchReference();
-    return isProtectedUser(repliedMessage?.author);
-  } catch {
-    return false;
+    tracker.opusStream.destroy();
+  } catch {}
+
+  try {
+    tracker.decoder.destroy();
+  } catch {}
+
+  try {
+    tracker.resampler.stdin.destroy();
+  } catch {}
+
+  try {
+    tracker.resampler.stdout.destroy();
+  } catch {}
+
+  try {
+    tracker.resampler.kill('SIGKILL');
+  } catch {}
+
+  if (session.activeSpeakerId === userId) {
+    session.activeSpeakerId = null;
   }
+
+  session.inputTrackers.delete(userId);
 }
+
+function startReceivingUser(session, userId) {
+  if (!isAllowedUser(userId)) return;
+  if (session.inputTrackers.has(userId)) return;
+  if (session.currentOutput) return;
+
+  const now = Date.now();
+
+  if (session.lastOutputAt && now - session.lastOutputAt < INPUT_COOLDOWN_MS) {
+    return;
+  }
+
+  if (session.activeSpeakerId && session.activeSpeakerId !== userId) {
+    return;
+  }
+
+  session.activeSpeakerId = userId;
+  session.inputBytes = 0;
+
+  const opusStream = session.connection.receiver.subscribe(userId, {
+    end: {
+      behavior: EndBehaviorType.AfterSilence,
+      duration: SILENCE_DURATION_MS,
+    },
+  });
+
+  const decoder = new prism.opus.Decoder({
+    rate: 48000,
+    channels: 2,
+    frameSize: 960,
+  });
+
+  const resampler = spawn(ffmpegPath, [
+    '-loglevel',
+    'error',
+    '-f',
+    's16le',
+    '-ar',
+    '48000',
+    '-ac',
+    '2',
+    '-i',
+    'pipe:0',
+    '-f',
+    's16le',
+    '-ar',
+    '24000',
+    '-ac',
+    '1',
+    'pipe:1',
+  ]);
+
+  const tracker = {
+    userId,
+    opusStream,
+    decoder,
+    resampler,
+    closed: false,
+  };
+
+  session.inputTrackers.set(userId, tracker);
+
+  opusStream.on('error', (error) => {
+    console.error(`Opus receive stream error for ${userId}:`, error);
+    cleanupInputTracker(session, userId);
+  });
+
+  decoder.on('error', (error) => {
+    console.error(`Opus decoder error for ${userId}:`, error);
+    cleanupInputTracker(session, userId);
+  });
+
+  resampler.on('error', (error) => {
+    console.error(`Resampler error for ${userId}:`, error);
+    cleanupInputTracker(session, userId);
+  });
+
+  resampler.stderr.on('data', (data) => {
+    const text = data.toString().trim();
+    if (text) {
+      console.error(`Input resampler stderr for ${userId}:`, text);
+    }
+  });
+
+  resampler.stdout.on('data', (chunk) => {
+    sendPcmChunkToRealtime(session, chunk);
+  });
+
+  const safeCleanup = () => {
+    if (tracker.closed) return;
+
+    commitUserAudio(session, userId);
+    cleanupInputTracker(session, userId);
+  };
+
+  opusStream.on('end', safeCleanup);
+  opusStream.on('close', safeCleanup);
+  resampler.stdout.on('close', () => {});
+
+  opusStream.pipe(decoder).pipe(resampler.stdin);
+
+  console.log(`Started receiving voice from user ${userId} in guild ${session.guildId}`);
+}
+
+function attachReceiver(session) {
+  session.connection.receiver.speaking.on('start', (userId) => {
+    if (!isAllowedUser(userId)) return;
+    startReceivingUser(session, userId);
+  });
+}
+
+function destroyGuildSession(guildId) {
+  const session = guildSessions.get(guildId);
+  if (!session) return;
+
+  for (const userId of session.inputTrackers.keys()) {
+    cleanupInputTracker(session, userId);
+  }
+
+  stopCurrentOutput(session);
+
+  try {
+    session.player.stop(true);
+  } catch {}
+
+  try {
+    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+      session.ws.close();
+    }
+  } catch {}
+
+  try {
+    if (session.connection) {
+      session.connection.destroy();
+    }
+  } catch {}
+
+  guildSessions.delete(guildId);
+}
+
+async function createGuildSession(voiceChannel) {
+  const guildId = voiceChannel.guild.id;
+
+  destroyGuildSession(guildId);
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
+
+  await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+
+  const player = createAudioPlayer({
+    behaviors: {
+      noSubscriber: NoSubscriberBehavior.Pause,
+    },
+  });
+
+  const session = {
+    guildId,
+    connection,
+    player,
+    ws: null,
+    wsReady: false,
+    currentOutput: null,
+    inputTrackers: new Map(),
+    inputBytes: 0,
+    lastOutputAt: 0,
+    activeSpeakerId: null,
+  };
+
+  player.on('error', (error) => {
+    console.error(`Audio player error in guild ${guildId}:`, error);
+  });
+
+  player.on(AudioPlayerStatus.Idle, () => {
+    if (session.currentOutput && session.currentOutput.closing) {
+      session.currentOutput = null;
+      session.lastOutputAt = Date.now();
+    }
+  });
+
+  connection.on('error', (error) => {
+    console.error(`Voice connection error in guild ${guildId}:`, error);
+  });
+
+  connection.subscribe(player);
+
+  guildSessions.set(guildId, session);
+
+  attachReceiver(session);
+  await createRealtimeSocket(session);
+
+  return session;
+}
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+});
 
 client.once('clientReady', () => {
   console.log(`Bot is online: ${client.user.tag}`);
-  console.log(`Prefix: ${prefix}`);
-  console.log(`Protected username: ${protectedUsername}`);
-  console.log(`Nod audio files: ${nodAudioFiles.join(', ')}`);
-  console.log(`Voice message duration: ${nodAudioDurationSeconds}s`);
+
+  if (allowedUserIds.size > 0) {
+    console.log(`Allowed users: ${Array.from(allowedUserIds).join(', ')}`);
+  } else {
+    console.log('Allowed users: all users');
+  }
 });
 
-client.on('messageCreate', async (message) => {
-  if (!message.guild) return;
-  if (message.author.bot) return;
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-  const mentionedProtectedUser = message.mentions.users.some((user) => isProtectedUser(user));
-  const repliedToProtectedUser = await isReplyToProtectedUser(message);
-  const authorIsProtectedUser = isProtectedUser(message.author);
-
-  if (!authorIsProtectedUser && (mentionedProtectedUser || repliedToProtectedUser)) {
-    await message.reply({
-      content: PROTECTED_REPLY_MESSAGE,
-      allowedMentions: { repliedUser: false },
+  if (!isAllowedUser(interaction.user.id)) {
+    await interaction.reply({
+      content: 'You are not allowed to use this bot.',
+      flags: 64,
     });
     return;
   }
 
-  if (!message.content.startsWith(prefix)) return;
+  if (interaction.commandName === 'join') {
+    const voiceChannel = interaction.member?.voice?.channel;
 
-  const content = message.content.slice(prefix.length).trim().replace(/\s+/g, ' ');
-  const normalizedContent = content.toLowerCase();
-
-  if (normalizedContent === WHAT_ARE_WE_COMMAND) {
-    const randomReply =
-      WHAT_ARE_WE_REPLIES[Math.floor(Math.random() * WHAT_ARE_WE_REPLIES.length)];
-
-    await message.reply({
-      content: randomReply,
-      allowedMentions: { repliedUser: false },
-    });
-    return;
-  }
-
-  const args = content.split(' ');
-  const command = args.shift()?.toLowerCase();
-
-  if (!command) return;
-
-  if (command === 'ping') {
-    await message.reply({
-      content: 'Pong!',
-      allowedMentions: { repliedUser: false },
-    });
-    return;
-  }
-
-  if (command === 'prefix') {
-    await message.reply({
-      content: `Current prefix: ${prefix}`,
-      allowedMentions: { repliedUser: false },
-    });
-    return;
-  }
-
-  if (command === 'sm') {
-    const text = args.join(' ').trim();
-
-    if (!text) {
-      await message.reply({
-        content: `Usage: ${prefix}sm <message>`,
-        allowedMentions: { repliedUser: false },
+    if (!voiceChannel) {
+      await interaction.reply({
+        content: 'You need to join a voice channel first.',
+        flags: 64,
       });
       return;
     }
 
-    if (!hasBotManageMessagesPermission(message)) {
-      await message.reply({
-        content: 'I do not have permission to delete messages in this channel.',
-        allowedMentions: { repliedUser: false },
+    const permissions = voiceChannel.permissionsFor(interaction.guild.members.me);
+
+    if (!permissions?.has(PermissionFlagsBits.Connect)) {
+      await interaction.reply({
+        content: 'I do not have permission to connect to this voice channel.',
+        flags: 64,
       });
       return;
     }
 
-    await message.delete().catch(() => {});
-    await message.channel.send(text);
-    return;
-  }
-
-  if (command === 'nod') {
-    if (!hasBotSendMessagesPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to send messages in this channel.',
-      );
+    if (!permissions?.has(PermissionFlagsBits.Speak)) {
+      await interaction.reply({
+        content: 'I do not have permission to speak in this voice channel.',
+        flags: 64,
+      });
       return;
     }
-
-    if (!hasBotAttachFilesPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to attach files in this channel.',
-      );
-      return;
-    }
-
-    const randomAudioFile = getRandomNodAudioFile();
 
     try {
-      await fs.access(randomAudioFile);
-    } catch {
-      await sendTemporaryMessage(
-        message.channel,
-        `Audio file not found: ${randomAudioFile}`,
-      );
-      return;
-    }
+      await createGuildSession(voiceChannel);
 
-    await message.delete().catch(() => {});
-
-    try {
-      await sendDiscordVoiceMessage(
-        message.channel,
-        randomAudioFile,
-        nodAudioDurationSeconds,
-      );
+      await interaction.reply({
+        content: `Joined voice channel: ${voiceChannel.name}. Live voice mode is now active.`,
+        flags: 64,
+      });
     } catch (error) {
-      console.error('Failed to send voice message:', error);
+      console.error('Failed to join voice channel:', error);
 
-      await sendTemporaryMessage(
-        message.channel,
-        'Failed to send the voice message. Check file format, permissions, and audio duration.',
-        6000,
-      );
+      destroyGuildSession(interaction.guild.id);
+
+      await interaction.reply({
+        content: 'Failed to start live voice mode. Check OpenAI credits, token, and permissions.',
+        flags: 64,
+      });
     }
 
     return;
   }
 
-  if (command === 'mute') {
-    if (!hasUserModerateMembersPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'You do not have permission to use this command.',
-      );
+  if (interaction.commandName === 'leave') {
+    const guildId = interaction.guild.id;
+    const connection = getVoiceConnection(guildId);
+
+    if (!connection && !guildSessions.has(guildId)) {
+      await interaction.reply({
+        content: 'I am not connected to a voice channel.',
+        flags: 64,
+      });
       return;
     }
 
-    if (!hasBotModerateMembersPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to timeout members.',
-      );
-      return;
-    }
+    destroyGuildSession(guildId);
 
-    if (!hasBotManageMessagesPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to delete the command message.',
-      );
-      return;
-    }
-
-    const targetUser = message.mentions.users.first();
-    const targetMember = message.mentions.members.first();
-    const durationInput = args[1];
-    const durationMs = parseDuration(durationInput);
-    const reason = args.slice(2).join(' ').trim() || 'No reason provided';
-
-    if (!targetUser || !targetMember) {
-      await sendTemporaryMessage(
-        message.channel,
-        `Usage: ${prefix}mute @user <10m|1h|1d> [reason]`,
-      );
-      return;
-    }
-
-    if (!durationMs) {
-      await sendTemporaryMessage(
-        message.channel,
-        `Usage: ${prefix}mute @user <10m|1h|1d> [reason]`,
-      );
-      return;
-    }
-
-    if (durationMs > 28 * 24 * 60 * 60 * 1000) {
-      await sendTemporaryMessage(
-        message.channel,
-        'Maximum mute duration is 28 days.',
-      );
-      return;
-    }
-
-    if (targetUser.id === message.author.id) {
-      await sendTemporaryMessage(
-        message.channel,
-        'You cannot mute yourself.',
-      );
-      return;
-    }
-
-    if (targetUser.id === client.user.id) {
-      await sendTemporaryMessage(
-        message.channel,
-        'You cannot mute the bot.',
-      );
-      return;
-    }
-
-    if (!targetMember.moderatable) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I cannot mute this member. Check role hierarchy and permissions.',
-      );
-      return;
-    }
-
-    await message.delete().catch(() => {});
-    await targetMember.timeout(durationMs, reason).catch(async () => {
-      await sendTemporaryMessage(
-        message.channel,
-        'Failed to mute this member.',
-      );
+    await interaction.reply({
+      content: 'Disconnected from the voice channel.',
+      flags: 64,
     });
+
     return;
   }
 
-  if (command === 'unmute') {
-    if (!hasUserModerateMembersPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'You do not have permission to use this command.',
-      );
-      return;
-    }
-
-    if (!hasBotModerateMembersPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to timeout members.',
-      );
-      return;
-    }
-
-    if (!hasBotManageMessagesPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to delete the command message.',
-      );
-      return;
-    }
-
-    const targetUser = message.mentions.users.first();
-    const targetMember = message.mentions.members.first();
-
-    if (!targetUser || !targetMember) {
-      await sendTemporaryMessage(
-        message.channel,
-        `Usage: ${prefix}unmute @user`,
-      );
-      return;
-    }
-
-    if (!targetMember.moderatable) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I cannot unmute this member. Check role hierarchy and permissions.',
-      );
-      return;
-    }
-
-    await message.delete().catch(() => {});
-    await targetMember.timeout(null).catch(async () => {
-      await sendTemporaryMessage(
-        message.channel,
-        'Failed to unmute this member.',
-      );
+  if (interaction.commandName === 'testvoice') {
+    await interaction.reply({
+      content: 'testvoice is disabled in live mode. Use /join and then speak.',
+      flags: 64,
     });
-    return;
-  }
-
-  if (command === 'clear' || command === 'clearall') {
-    if (!hasUserManageMessagesPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'You do not have permission to use this command.',
-      );
-      return;
-    }
-
-    if (!hasBotManageMessagesPermission(message)) {
-      await sendTemporaryMessage(
-        message.channel,
-        'I do not have permission to delete messages in this channel.',
-      );
-      return;
-    }
-  }
-
-  if (command === 'clear') {
-    const amount = Number.parseInt(args[0], 10);
-
-    if (!Number.isInteger(amount)) {
-      await sendTemporaryMessage(
-        message.channel,
-        `Usage: ${prefix}clear <amount>`,
-      );
-      return;
-    }
-
-    if (amount < 1 || amount > 99) {
-      await sendTemporaryMessage(
-        message.channel,
-        'Please enter a number between 1 and 99.',
-      );
-      return;
-    }
-
-    await handleClearCommand(message, amount);
-    return;
-  }
-
-  if (command === 'clearall') {
-    await handleClearAllCommand(message);
   }
 });
 
-client.login(token);
+client.login(DISCORD_TOKEN);
