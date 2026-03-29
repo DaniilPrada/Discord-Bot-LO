@@ -11,16 +11,19 @@ const token = process.env.DISCORD_TOKEN;
 const prefix = process.env.PREFIX || '!';
 const protectedUsername = 'michael_2024_pro';
 
-const fartAudioFile =
-  process.env.FART_AUDIO_FILE || path.join(__dirname, 'fart.ogg');
+const nudeAudioFiles = [
+  process.env.NUDE_AUDIO_FILE_1 || path.join(__dirname, 'nude1.ogg'),
+  process.env.NUDE_AUDIO_FILE_2 || path.join(__dirname, 'nude2.ogg'),
+  process.env.NUDE_AUDIO_FILE_3 || path.join(__dirname, 'nude3.ogg'),
+];
 
-const parsedFartDuration = Number.parseFloat(
-  process.env.FART_AUDIO_DURATION_SECONDS || '2.4',
+const parsedNudeDuration = Number.parseFloat(
+  process.env.NUDE_AUDIO_DURATION_SECONDS || '2.4',
 );
 
-const fartAudioDurationSeconds =
-  Number.isFinite(parsedFartDuration) && parsedFartDuration > 0
-    ? parsedFartDuration
+const nudeAudioDurationSeconds =
+  Number.isFinite(parsedNudeDuration) && parsedNudeDuration > 0
+    ? parsedNudeDuration
     : 2.4;
 
 const WHAT_ARE_WE_COMMAND = 'מה אנחנו';
@@ -159,6 +162,10 @@ function getAudioContentType(filePath) {
   return contentTypeMap[extension] || null;
 }
 
+function getRandomNudeAudioFile() {
+  return nudeAudioFiles[Math.floor(Math.random() * nudeAudioFiles.length)];
+}
+
 async function sendDiscordVoiceMessage(channel, filePath, durationSecs) {
   const audioBuffer = await fs.readFile(filePath);
   const fileName = path.basename(filePath);
@@ -171,7 +178,6 @@ async function sendDiscordVoiceMessage(channel, filePath, durationSecs) {
   }
 
   const waveform = buildWaveform();
-
   const form = new FormData();
 
   form.append(
@@ -286,8 +292,8 @@ client.once('clientReady', () => {
   console.log(`Bot is online: ${client.user.tag}`);
   console.log(`Prefix: ${prefix}`);
   console.log(`Protected username: ${protectedUsername}`);
-  console.log(`Voice message audio file: ${fartAudioFile}`);
-  console.log(`Voice message duration: ${fartAudioDurationSeconds}s`);
+  console.log(`Nude audio files: ${nudeAudioFiles.join(', ')}`);
+  console.log(`Voice message duration: ${nudeAudioDurationSeconds}s`);
 });
 
 client.on('messageCreate', async (message) => {
@@ -367,7 +373,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  if (command === 'noud' || command === 'fart') {
+  if (command === 'nude') {
     if (!hasBotSendMessagesPermission(message)) {
       await sendTemporaryMessage(
         message.channel,
@@ -384,12 +390,14 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    const randomAudioFile = getRandomNudeAudioFile();
+
     try {
-      await fs.access(fartAudioFile);
+      await fs.access(randomAudioFile);
     } catch {
       await sendTemporaryMessage(
         message.channel,
-        `Audio file not found: ${fartAudioFile}`,
+        `Audio file not found: ${randomAudioFile}`,
       );
       return;
     }
@@ -399,8 +407,8 @@ client.on('messageCreate', async (message) => {
     try {
       await sendDiscordVoiceMessage(
         message.channel,
-        fartAudioFile,
-        fartAudioDurationSeconds,
+        randomAudioFile,
+        nudeAudioDurationSeconds,
       );
     } catch (error) {
       console.error('Failed to send voice message:', error);
